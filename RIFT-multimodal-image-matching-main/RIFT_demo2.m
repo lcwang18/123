@@ -1,0 +1,130 @@
+clc; clear; close all;
+warning('off');
+addpath sar-optical;  % 若需要，保留该路径
+
+%% 批量处理参数设置
+img_folder1 = "E:\dataset\t1";  % 外部文件夹路径
+img_folder2 = "E:\dataset\sar_vis";
+num_pairs = 4415;  % 图像对总数（根据实际数量修改）
+img_ext = '.tif';  % 图像格式（如.png/.bmp）
+success_count = 0;
+
+cmr_values = zeros(1, num_pairs);  % 存储每对的CMR
+rmse_values = zeros(1, num_pairs);  % 存储每对的RMSE
+time_values = zeros(1, num_pairs);  % 新增：存储单张配准时间
+
+%% 新增：记录总处理开始时间
+total_start_time = tic;
+
+%% 批量循环处理
+for i = 1:num_pairs
+    fprintf('\n===== 处理第 %d/%d 对图像 =====\n', i, num_pairs);
+    
+    % 新增：记录单张处理开始时间
+    pair_start_time = tic;
+    
+    % 构建外部文件夹中图像的完整路径（关键修改：拼接文件夹路径）
+    str1 = fullfile(img_folder1, sprintf('img1 (%d)%s', i, img_ext));
+    str2 = fullfile(img_folder2, sprintf('img2 (%d)%s', i, img_ext));
+    
+    str1 = fullfile(img_folder1, sprintf('pre-event_%d%s', i, img_ext));
+    str2 = fullfile(img_folder2, sprintf('post-event_%d%s', i, img_ext));
+
+    try
+        % 读取图像（从外部文件夹）
+        if ~exist(str1, 'file') || ~exist(str2, 'file')
+            error('图像不存在: %s 或 %s', str1, str2);
+        end
+        im1 = im2uint8(imread(str1));
+        im2 = im2uint8(imread(str2));
+        
+        % 确保图像为3通道（兼容灰度图）
+        if size(im1,3) == 1, im1 = repmat(im1, [1,1,3]); end
+        if size(im2,3) == 1, im2 = repmat(im2, [1,1,3]); end
+        
+        % 4. RIFT特征提取与匹配
+        [des_m1, des_m2] = RIFT_no_rotation_invariance(im1, im2, 4, 6, 96);
+        [indexPairs, ~] = matchFeatures(des_m1.des, des_m2.des, ...
+            'MaxRatio', 0.85, 'MatchThreshold', 100, 'Method', 'Approximate');
+        
+        % 5. 匹配点去重
+        matchedPoints1 = des_m1.kps(indexPairs(:,1), :);
+        matchedPoints2 = des_m2.kps(indexPairs(:,2), :);
+        [~, uniqueIdx] = unique(matchedPoints2, 'rows', 'stable');
+        matchedPoints1 = matchedPoints1(uniqueIdx, :);
+        matchedPoints2 = matchedPoints2(uniqueIdx, :);
+        total_matches = size(matchedPoints1, 1);
+
+        if total_matches == 0
+            error('无初始匹配点');
+        end
+
+        % 6. 外点剔除与指标计算
+        H = FSC(matchedPoints1, matchedPoints2, 'affine', 4);
+        Y_ = H * [matchedPoints1'; ones(1, total_matches)];
+        Y_(1,:) = Y_(1,:) ./ Y_(3,:);
+        Y_(2,:) = Y_(2,:) ./ Y_(3,:);
+        E = sqrt(sum((Y_(1:2,:) - matchedPoints2').^2, 1));
+        
+        % 动态内点阈值
+        median_err = median(E);
+        inlier_thresh = max(3, median_err * 1.5);
+        inliersIndex = E < 3;
+        inliers_count = sum(inliersIndex);
+
+        if inliers_count < 5
+            error('内点数量不足（<5个）');
+        end
+
+        % 7. 计算当前对的CMR和RMSE
+        cmr = inliers_count / total_matches;
+        [~, rmse] = LSM(matchedPoints1(inliersIndex,:), matchedPoints2(inliersIndex,:), 'affine');
+        cmr_values(i) = cmr;
+        rmse_values(i) = rmse;
+        success_count = success_count + 1;
+
+        % 新增：计算单张处理时间（秒）
+        pair_time = toc(pair_start_time);
+        time_values(i) = pair_time;
+
+        % 8. 输出当前对结果（仅文字）- 新增配准时间
+        fprintf('第 %3d/%d 对：CMR=%.4f | RMSE=%.4f | 匹配点总数=%d | 内点数=%d | 配准时间=%.4fs\n', ...
+            i, num_pairs, cmr, rmse, total_matches, inliers_count, pair_time);
+
+    catch err
+        % 处理失败：标记为NaN，输出错误信息
+        cmr_values(i) = NaN;
+        rmse_values(i) = NaN;
+        time_values(i) = NaN;  % 失败样本时间记为NaN
+        fprintf('第 %3d/%d 对：处理失败 | 原因：%s\n', i, num_pairs, err.message);
+    end
+end
+
+%% 新增：计算总处理时间
+total_time = toc(total_start_time);
+
+%% 9. 计算并输出最终统计结果
+valid_idx = ~isnan(cmr_values);
+if success_count > 0
+    avg_cmr = mean(cmr_values(valid_idx));
+    avg_rmse = mean(rmse_values(valid_idx));
+    std_cmr = std(cmr_values(valid_idx));  % 增加标准差，反映稳定性
+    std_rmse = std(rmse_values(valid_idx));
+    
+    % 新增：计算平均单张处理时间
+    avg_pair_time = mean(time_values(valid_idx));
+
+    fprintf('\n===== 批量处理完成 =====\n');
+    fprintf('总图像对数量：%d\n', num_pairs);
+    fprintf('成功处理数量：%d（成功率=%.1f%%）\n', success_count, success_count/num_pairs*100);
+    fprintf('平均CMR：%.4f（±%.4f）\n', avg_cmr, std_cmr);
+    fprintf('平均RMSE：%.4f（±%.4f）\n', avg_rmse, std_rmse);
+    fprintf('平均单张配准时间：%.4fs\n', avg_pair_time);  % 新增
+    fprintf('总处理时间：%.4fs\n', total_time);  % 新增
+else
+    fprintf('\n===== 批量处理完成 =====\n');
+    fprintf('所有 %d 对图像处理失败，无有效指标结果\n', num_pairs);
+    fprintf('总处理时间：%.4fs\n', total_time);  % 新增
+end
+
+warning('on');
